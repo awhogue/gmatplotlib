@@ -7,6 +7,14 @@ import numpy as np
 
 """
 Libraries for working with matplotlib and Google Maps.
+
+Example usage:
+
+import gmatplotlib as gm
+# Points should look like [[(40.7, -72.0), (41.3, -72.2), ...],
+                           [(37.78, -122.40), (37.8, -122.39)]]
+points = ...
+gm.plot_points_on_map(points, output_filename='myfig.png')
 """
 
 # Pixels per degree of longitude for each zoom level.  Constant at all longitudes because
