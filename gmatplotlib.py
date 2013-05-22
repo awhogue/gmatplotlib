@@ -158,7 +158,7 @@ def fit_center_span(latitudes, longitudes, percentile=0.7):
 
   return (center, span)
 
-_COLORS = ['green', 'blue', 'red', 'purple']
+_COLORS = ['green', 'blue', 'red', 'yellow', 'purple']
 
 def plot_points_on_map(points, tmp_image_dir='/tmp/mapimages', filename=None):
   """Given a set of points, plot them on a map using matplotlib.
@@ -170,6 +170,9 @@ def plot_points_on_map(points, tmp_image_dir='/tmp/mapimages', filename=None):
     image_dir: A directory in which to store images.  The temporary image downloaded from
                the Google Static Maps API will be stored here.
     filename: A file in which to store the plot itself.
+  
+  Returns:
+    The Basemap object.
   """
   lats = [x[0] for group in points for x in group]
   lngs = [x[1] for group in points for x in group]
@@ -197,4 +200,153 @@ def plot_points_on_map(points, tmp_image_dir='/tmp/mapimages', filename=None):
     m.scatter(x, y, marker='.', c=color, lw=0.2)
 
   if filename:
-    plt.savefig(filename)
+    plt.savefig(filename, bbox_inches='tight')
+
+  return m
+
+
+################################################################
+## Contour plotting
+################################################################
+
+class Gaussian:
+  """Represents a single Gaussian shape and its components."""
+
+  def __init__(self, mix, mu, covariance):
+    """Initialize this Gaussian with the given mixing coefficient, mu, and covariance.
+
+    Args:
+      mix: The mixing coefficient.
+      mu: A 2-tuple containing the x,y mean.
+      covariance: A 3-tuple containing the elements of the covariance matrix, C11, C12 (=C21), C22.
+    """
+    self.mixing_coefficient = mix
+    self.mu_x = mu[0]
+    self.mu_y = mu[1]
+    self.covariance_11 = covariance[0]
+    self.covariance_12 = covariance[1]
+    self.covariance_22 = covariance[2]
+
+  def __str__(self):
+    return ('\t\tmixing_coefficient: %f\n' % self.mixing_coefficient + \
+            '\t\t              mu_x: %f\n' % self.mu_x + \
+            '\t\t              mu_y: %f\n' % self.mu_y + \
+            '\t\t     covariance_11: %f\n' % self.covariance_11 + \
+            '\t\t     covariance_12: %f\n' % self.covariance_12 + \
+            '\t\t     covariance_22: %f'   % self.covariance_22)
+
+LOG_2PI = math.log(math.pi * 2.0)
+RADIUS = 6367000.0  # Earth's radius in meters.
+
+class VenueShape:
+  def __init__(self, venueid, venuename, center, gaussians):
+    """Create a venue shape from the given data
+
+    Args:
+      venueid: The venue's ID.
+      venuename: The venue's name.
+      center: A 2-tuple of the lat,lng for the center point of the venue.
+      gaussians: A list of Gaussian objects making up the shape.
+    """
+    self.venueid = venueid
+    self.components = gaussians
+    self.center = center
+    self.name = venuename
+
+    # Stereographic projection compnents
+    self.phi_1 = math.radians(self.center[0])
+    self.lam_0 = math.radians(self.center[1])
+    self.sin_phi_1 = math.sin(self.phi_1)
+    self.cos_phi_1 = math.cos(self.phi_1)
+
+    self.center_prob = self.log_density(self.center[0], self.center[1])
+
+    self.vec_value = np.vectorize(self.value)
+
+  def __str__(self):
+    out = '%s (%s)\n\tCenter: (%f, %f)\n' % (self.name, self.venueid, self.center[0], self.center[1])
+    return out + '\n'.join(['\tComponent %d:\n%s' % (ii, str(x)) for ii, x in enumerate(self.components)])
+
+  def project(self, lat, lng):
+    """Project the given lat,lng into stereographic space around the venue's center."""
+    phi = math.radians(lat)
+    lam = math.radians(lng)
+    cos_phi = math.cos(phi)
+    cos_lam_lam_0 = math.cos(lam - self.lam_0)
+    sin_phi = math.sin(phi)
+    k = (2.0 * RADIUS) / (1.0 + self.sin_phi_1 * sin_phi + self.cos_phi_1 * cos_phi * cos_lam_lam_0)
+
+    return ((k * cos_phi * math.sin(lam - self.lam_0)),
+            (k * (self.cos_phi_1 * sin_phi - self.sin_phi_1 * cos_phi * cos_lam_lam_0)))
+
+
+  def log_density(self, lat, lng):
+    """Return the value of this model at the given lat,lng."""
+    (x, y) = self.project(lat, lng)
+
+    def value_for_component(cmp):
+      det = cmp.covariance_11 * cmp.covariance_22 - cmp.covariance_12 * cmp.covariance_12
+      inv = (cmp.covariance_22 / det, -1.0 * cmp.covariance_12 / det, cmp.covariance_11 / det)
+      if cmp.mixing_coefficient < 1e-10 or det < 1e-10:
+        return -50.0
+      else:
+        xd = x - cmp.mu_x
+        yd = y - cmp.mu_y
+        quad = xd * xd * inv[0] + xd * yd * inv[1] + yd * yd * inv[2]
+        return -0.5 * quad - 0.5 * math.log(det) - LOG_2PI + math.log(cmp.mixing_coefficient)
+
+    cluster_values = [value_for_component(c) for c in self.components]
+    m = np.max(cluster_values)
+    def exp(v):
+      if v - m < -50.0: return 0.0
+      else: return math.exp(v - m)
+
+    log_prob = m + math.log(np.sum([exp(v) for v in cluster_values]))
+    return log_prob
+
+  def value(self, lng, lat):
+    return self.log_density(lat, lng)
+  
+
+def make_mesh(m):
+  """Make a meshgrid appropriate for plotting on the given Basemap instance."""
+  # TODO: derive this automatically based on size of plot.
+  resolution = .0001
+  minx, maxx = (m.llcrnrlon, m.urcrnrlon)
+  miny, maxy = (m.llcrnrlat, m.urcrnrlat)
+  x = np.arange(minx, maxx, resolution)
+  y = np.arange(miny, maxy, resolution)
+  return np.meshgrid(x, y)
+  
+
+def plot_one_shape(m, shape):
+  """Plot a single venue shape on the given map.
+
+  Args:
+    m: A Basemap instance.
+    shape: A VenueShape object to plot.
+  """
+  X, Y = make_mesh(m)
+  Z = shape.vec_value(X, Y)
+  contour = m.contour(X, Y, Z, latlon=True, linewidth=2.0,
+                      levels=[-10, -5, -3, -1, 0],
+                      colors=['blue', 'cyan', 'green', 'orange', 'red'])
+  plt.clabel(contour, inline=1, fontsize=10)
+
+def plot_two_shapes(m, shape1, shape2):
+  """Plot two venue shapes on the given map, highlighting the boundary between the two.
+
+  Args:
+    m: A Basemap instance.
+    shape1, shape2: VenueShape objects to plot.
+  """
+  X, Y = make_mesh(m)
+  Z = shape1.vec_value(X, Y) - shape2.vec_value(X, Y)
+
+  contour = m.contour(X, Y, Z, latlon=True, linewidth=2.0,
+                      levels=[-10, -5, -3, -1, 0, 1, 3, 5, 10],
+                      colors=['blue', 'cyan', 'green', 'orange', 'red', 'orange', 'green', 'cyan', 'blue'])
+  plt.clabel(contour, inline=1, fontsize=10)
+  m.contourf(X, Y, Z, latlon=True, alpha=0.2,
+             levels=[-10, -5, -3, -1, 0, 1, 3, 5, 10],
+             colors=['white', 'white', 'white', 'red', 'red', 'white', 'white', 'white'])
